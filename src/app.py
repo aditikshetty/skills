@@ -5,11 +5,26 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from src.teacher_auth import (
+    DUMMY_PASSWORD_HASH,
+    DUMMY_PASSWORD_SALT,
+    SESSION_COOKIE_NAME,
+    SESSION_DURATION_SECONDS,
+    _signing_key,
+    create_session_token,
+    get_teacher_from_token,
+    load_teacher_credentials,
+    require_teacher,
+    verify_password,
+)
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +33,12 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+class TeacherLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+
 
 # In-memory activity database
 activities = {
@@ -83,13 +104,56 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.get("/auth/me")
+def get_current_teacher(request: Request):
+    username = get_teacher_from_token(request.cookies.get(SESSION_COOKIE_NAME))
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/login")
+def login_teacher(
+    credentials: TeacherLoginRequest, request: Request, response: Response
+):
+    signing_key = _signing_key()
+    teacher_accounts = load_teacher_credentials()
+    account = teacher_accounts.get(credentials.username)
+    salt = account["salt"] if account is not None else DUMMY_PASSWORD_SALT
+    password_hash = (
+        account["password_hash"] if account is not None else DUMMY_PASSWORD_HASH
+    )
+    password_matches = verify_password(credentials.password, salt, password_hash)
+    if account is None or not password_matches:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=create_session_token(credentials.username, signing_key),
+        max_age=SESSION_DURATION_SECONDS,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return {"message": "Teacher login successful.", "username": credentials.username}
+
+
+@app.post("/auth/logout")
+def logout_teacher(response: Response):
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME, httponly=True, samesite="strict", path="/"
+    )
+    return {"message": "Teacher logged out."}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str, email: str, teacher: str = Depends(require_teacher)
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +175,9 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str, email: str, teacher: str = Depends(require_teacher)
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
